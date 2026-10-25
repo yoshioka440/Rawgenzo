@@ -2,6 +2,8 @@ import CoreImage
 
 /// macOS標準のCIRAWFilterによるデコーダ。デモザイクからNR・シャープネスまでGPUで処理される。
 /// レンズ補正は機種によって非対応(α7S III の ARW は isLensCorrectionSupported == false で補正されない)。
+/// SIGMA fp L の DNG は対応しているが、歪曲と倍率色収差を個別に切れず、周辺減光(GainMap)は使わないので、
+/// どの機種でもデコーダ側は切り、RAW に記録された値で自前で補正する(LensCorrector)。
 public final class CoreImageRAWSource: RAWSource {
     public let url: URL
     public let metadata: RAWMetadata
@@ -57,7 +59,6 @@ public final class CoreImageRAWSource: RAWSource {
         filter.luminanceNoiseReductionAmount = clamp(s.luminanceNoiseReduction, DetailRanges.luminanceNoiseReduction) ?? defaults.lumaNR
         filter.colorNoiseReductionAmount = clamp(s.colorNoiseReduction, DetailRanges.colorNoiseReduction) ?? defaults.colorNR
         // レンズ補正は RAW に記録された値で自前で行う(LensCorrector)。二重に掛けないよう、デコーダ側は切る。
-        // CIRAWFilter がレンズ補正に対応している機種を追加するときは、どちらを使うか見直すこと
         if filter.isLensCorrectionSupported {
             filter.isLensCorrectionEnabled = false
         }

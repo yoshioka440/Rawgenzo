@@ -1043,12 +1043,14 @@ final class SampleFileTests: XCTestCase {
         }
         let engine = RAWEngine()
         let urls = try engine.listCandidates(in: URL(fileURLWithPath: (dir as NSString).expandingTildeInPath))
-        XCTAssertFalse(urls.isEmpty, "ARWが見つかりません")
+        XCTAssertFalse(urls.isEmpty, "RAWが見つかりません")
 
         let context = CIContext()
         for url in urls {
             let photo = try engine.open(url)
-            XCTAssertEqual(photo.profile.id, "sony.ilce-7sm3")
+            // サンプルは α7S III の ARW と fp L の DNG
+            XCTAssertEqual(photo.profile.id, url.pathExtension.lowercased() == "dng" ? "sigma.fp-l" : "sony.ilce-7sm3",
+                           url.lastPathComponent)
             var s = photo.settings
             s.hdr.strength = 0.5
             s.saturation = 1.2
@@ -1547,5 +1549,307 @@ final class TiltEstimatorTests: XCTestCase {
         // 左右の順は問わない
         XCTAssertEqual(TiltEstimator.mark(.eyes, CGPoint(x: 500, y: 510), CGPoint(x: 400, y: 500), size)!.angle, m.angle, accuracy: 1e-9)
         XCTAssertNil(TiltEstimator.mark(.eyes, CGPoint(x: 400, y: 500), CGPoint(x: 410, y: 560), size), "縦に近い線は手がかりにしない")
+    }
+}
+
+/// DNG のレンズ補正(オプコード)の読み取りと換算
+final class DNGLensTests: XCTestCase {
+    private let ctx = CIContext()
+
+    /// 実サンプルの DNG(RAW_SAMPLE_DIR のときだけ)
+    private func sample(_ name: String) throws -> URL {
+        guard let dir = ProcessInfo.processInfo.environment["RAW_SAMPLE_DIR"] else { throw XCTSkip("RAW_SAMPLE_DIR が未設定") }
+        let url = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath).appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: url.path) else { throw XCTSkip("\(name) がありません") }
+        return url
+    }
+
+    /// CIRAWFilter で縮小して描いた画素(RGBA、リニア)
+    private func render(_ url: URL, lens: Bool, scale: Float = 0.125) throws -> (pixels: [Float], width: Int, height: Int) {
+        let f = try XCTUnwrap(CIRAWFilter(imageURL: url))
+        f.scaleFactor = scale
+        f.isLensCorrectionEnabled = lens
+        let img = try XCTUnwrap(f.outputImage)
+        let w = Int(img.extent.width), h = Int(img.extent.height)
+        var px = [Float](repeating: 0, count: w * h * 4)
+        ctx.render(img, toBitmap: &px, rowBytes: w * 16, bounds: img.extent, format: .RGBAf,
+                   colorSpace: CGColorSpace(name: CGColorSpace.linearSRGB))
+        return (px, w, h)
+    }
+
+    private func meanDifference(_ a: [Float], _ b: [Float]) -> Double {
+        zip(a, b).reduce(0.0) { $0 + Double(abs($1.0 - $1.1)) } / Double(a.count)
+    }
+
+    /// OpcodeList2 の最初のオプコードを「知らない・省いてよい」ものに書き換えた写し(タグの並びは変えない)
+    private func copyWithoutGainMap(_ url: URL) throws -> URL {
+        var data = try Data(contentsOf: url)
+        let tiff = try XCTUnwrap(TIFFReader(data: data))
+        let ifd0 = try XCTUnwrap(tiff.firstIFDOffset)
+        let entries0 = try XCTUnwrap(tiff.entries(atIFD: ifd0))
+        let subs = try XCTUnwrap(entries0.first { $0.tag == 0x014a }.flatMap { tiff.integers($0) })
+        let entry = try XCTUnwrap(subs.compactMap { tiff.entries(atIFD: $0) }.flatMap { $0 }.first { $0.tag == 51009 })
+        // 値の位置(リトルエンディアンの 4 バイト)→ オプコードの並び(ビッグエンディアン)
+        let p = Int(data[entry.fieldOffset]) | Int(data[entry.fieldOffset + 1]) << 8
+            | Int(data[entry.fieldOffset + 2]) << 16 | Int(data[entry.fieldOffset + 3]) << 24
+        XCTAssertEqual(data[p + 7], UInt8(DNGLensCorrection.gainMapID))
+        data[p + 4 ..< p + 8] = Data([0, 0, 0x03, 0xE7])      // 番号 999(知らないオプコード)
+        data[p + 12 ..< p + 16] = Data([0, 0, 0, 1])          // 省いてよい
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".DNG")
+        try data.write(to: out)
+        addTeardownBlock { try? FileManager.default.removeItem(at: out) }
+        return out
+    }
+
+    /// Core Image は DNG の GainMap を使わない(デコーダのレンズ補正がオンでもオフでも、GainMap の有無で出力が同じ)。
+    /// なので自前の周辺減光の補正と二重にならない。macOS 27.0 で確認(2026-10-25)。OS が変わって GainMap を使い始めたら失敗する
+    func testDecoderIgnoresGainMap() throws {
+        let url = try sample("SDIM7600.DNG")
+        let stripped = try copyWithoutGainMap(url)
+        XCTAssertNil(DNGLensCorrection.readTags(from: stripped)?.gainMap)
+        let off = try render(url, lens: false), offStripped = try render(stripped, lens: false)
+        let on = try render(url, lens: true), onStripped = try render(stripped, lens: true)
+        let dOff = meanDifference(off.pixels, offStripped.pixels)
+        let dOn = meanDifference(on.pixels, onStripped.pixels)
+        XCTAssertLessThan(dOff, 1e-6)
+        XCTAssertLessThan(dOn, 1e-6)
+    }
+}
+
+extension DNGLensTests {
+    /// 自前の歪曲・倍率色収差の補正(WarpRectilinear を換算したもの)が、Core Image の補正とほぼ同じ画像になる。
+    /// 「補正なし」と Core Image の差に比べて、自前と Core Image の差が十分小さいことで確かめる
+    func testWarpMatchesCoreImage() throws {
+        for (name, scale) in [("SDIM7600.DNG", Float(0.125)), ("SDIM7513.DNG", Float(0.0625))] {
+            let url = try sample(name)
+            let data = try XCTUnwrap(DNGLensCorrection.read(from: url))
+            let reference = try render(url, lens: true, scale: scale)
+            let plain = try render(url, lens: false, scale: scale)
+
+            // デコーダの補正を切った画像に、自前で歪曲と倍率色収差だけ掛ける
+            let f = try XCTUnwrap(CIRAWFilter(imageURL: url))
+            f.scaleFactor = scale
+            f.isLensCorrectionEnabled = false
+            let warp = LensCorrectionSettings(vignetting: false, distortion: true, chromaticAberration: true)
+            let mine = try LensCorrector.apply(try XCTUnwrap(f.outputImage), data: data, settings: warp)
+            var px = [Float](repeating: 0, count: reference.width * reference.height * 4)
+            ctx.render(mine, toBitmap: &px, rowBytes: reference.width * 16, bounds: mine.extent, format: .RGBAf,
+                       colorSpace: CGColorSpace(name: CGColorSpace.linearSRGB))
+
+            let before = meanDifference(plain.pixels, reference.pixels)
+            let after = meanDifference(px, reference.pixels)
+            // 比べるための外れ: 歪曲を 2 倍に掛けたもの。換算(半径の取り方)を誤れば、こちらに近い差になる
+            let doubled = LensCorrectionData(knots: data.knots, distortion: data.distortion.map { 1 + 2 * ($0 - 1) },
+                                             chromaticRed: data.chromaticRed, chromaticBlue: data.chromaticBlue,
+                                             vignetting: data.vignetting, cameraSettings: .all)
+            let wrong = try LensCorrector.apply(try XCTUnwrap(f.outputImage), data: doubled, settings: warp)
+            var pxWrong = px
+            ctx.render(wrong, toBitmap: &pxWrong, rowBytes: reference.width * 16, bounds: wrong.extent, format: .RGBAf,
+                       colorSpace: CGColorSpace(name: CGColorSpace.linearSRGB))
+            let off = meanDifference(pxWrong, reference.pixels)
+            print(String(format: "%@: Core Image との差 補正なし %.5f / 自前 %.5f / 歪曲 2 倍 %.5f",
+                         name, before, after, off))
+            // 残る差(0.001 前後)は補間のしかたの違いで、歪曲の小さいレンズでは割合が大きく見える。
+            // 補正なしの 1/4 未満、かつ 2 倍に掛けたものより十分小さいことを見る
+            XCTAssertLessThan(after, before * 0.25, name)
+            XCTAssertLessThan(after, off * 0.25, name)
+        }
+    }
+}
+
+extension DNGLensTests {
+    // MARK: 合成データ
+
+    /// ビッグエンディアンのバイト列を組み立てる
+    private struct BE {
+        var data = Data()
+        mutating func u32(_ v: UInt32) { data += withUnsafeBytes(of: v.bigEndian) { Data($0) } }
+        mutating func f64(_ v: Double) { data += withUnsafeBytes(of: v.bitPattern.bigEndian) { Data($0) } }
+        mutating func f32(_ v: Float) { data += withUnsafeBytes(of: v.bitPattern.bigEndian) { Data($0) } }
+    }
+
+    /// オプコードの並び(1 件ずつ: 番号・版・フラグ・パラメータ)
+    private func opcodeList(_ ops: [(UInt32, Data)]) -> Data {
+        var b = BE()
+        b.u32(UInt32(ops.count))
+        for (id, params) in ops {
+            b.u32(id); b.u32(0x0103_0000); b.u32(0); b.u32(UInt32(params.count))
+            b.data += params
+        }
+        return b.data
+    }
+
+    private func warpParams(_ planes: [[Double]], cx: Double = 0.5, cy: Double = 0.5) -> Data {
+        var b = BE()
+        b.u32(UInt32(planes.count))
+        for k in planes { k.forEach { b.f64($0) } }
+        b.f64(cx); b.f64(cy)
+        return b.data
+    }
+
+    /// 範囲 (0,0)-(h,w) に、点 rows×cols のゲインの表
+    private func gainMapParams(width: Int, height: Int, rows: Int, cols: Int, gain: (Double, Double) -> Float) -> Data {
+        var b = BE()
+        [0, 0, height, width, 0, 1, 1, 1, rows, cols].forEach { b.u32(UInt32($0)) }
+        b.f64(1 / Double(rows - 1)); b.f64(1 / Double(cols - 1)); b.f64(0); b.f64(0)
+        b.u32(1)
+        for i in 0..<rows {
+            for j in 0..<cols { b.f32(gain(Double(j) / Double(cols - 1) * Double(width), Double(i) / Double(rows - 1) * Double(height))) }
+        }
+        return b.data
+    }
+
+    func testParsesOpcodes() throws {
+        let k: [[Double]] = [[0.99, -0.02, 0.01, 0, 0, 0], [1, -0.03, 0.02, -0.005, 0, 0], [1.01, -0.03, 0.02, 0, 0, 0]]
+        let list = opcodeList([(DNGLensCorrection.warpRectilinearID, warpParams(k, cx: 0.4, cy: 0.6)), (7, Data([1, 2, 3]))])
+        let ops = try XCTUnwrap(DNGLensCorrection.parseOpcodes(list))
+        XCTAssertEqual(ops.map(\.id), [1, 7])
+        let w = try XCTUnwrap(DNGLensCorrection.warp(from: ops[0].params))
+        XCTAssertEqual(w.planes, k)
+        XCTAssertEqual(w.centerX, 0.4)
+        XCTAssertEqual(w.centerY, 0.6)
+        XCTAssertEqual(w.factor(plane: 1, at: 1), 1 - 0.03 + 0.02 - 0.005, accuracy: 1e-12)
+
+        let g = try XCTUnwrap(DNGLensCorrection.gainMap(from: gainMapParams(width: 300, height: 200, rows: 3, cols: 4) { x, _ in Float(1 + x / 300) }))
+        XCTAssertEqual(g.pointsV, 3)
+        XCTAssertEqual(g.pointsH, 4)
+        // 表の点の間は直線で補間し、外は端の値
+        XCTAssertEqual(g.gain(x: 150, y: 77), 1.5, accuracy: 1e-6)
+        XCTAssertEqual(g.gain(x: 900, y: 77), 2, accuracy: 1e-6)
+    }
+
+    func testRejectsBrokenOpcodes() {
+        let k: [[Double]] = [[1, 0, 0, 0, 0, 0]]
+        let good = opcodeList([(DNGLensCorrection.warpRectilinearID, warpParams(k))])
+        // 途中で切れている・件数が大きすぎる
+        XCTAssertNil(DNGLensCorrection.parseOpcodes(good.prefix(good.count - 1)))
+        XCTAssertNil(DNGLensCorrection.parseOpcodes(Data([0xFF, 0xFF, 0xFF, 0xFF])))
+        // プレーン数 0・中心が範囲外
+        XCTAssertNil(DNGLensCorrection.warp(from: warpParams([])))
+        XCTAssertNil(DNGLensCorrection.warp(from: warpParams(k, cx: 1.5)))
+        XCTAssertNil(DNGLensCorrection.warp(from: warpParams(k).prefix(20)))
+        // ゲインが 0 以下・点が足りない
+        XCTAssertNil(DNGLensCorrection.gainMap(from: gainMapParams(width: 10, height: 10, rows: 2, cols: 2) { _, _ in 0 }))
+        XCTAssertNil(DNGLensCorrection.gainMap(from: gainMapParams(width: 10, height: 10, rows: 2, cols: 2) { _, _ in 1 }.dropLast(4)))
+    }
+
+    /// 換算: 出力の画像の半径 r(半対角 = 1)を、WarpRectilinear の半径(光学中心から一番遠い隅 = 1)に直す
+    func testConvertsWarpToLensData() throws {
+        let k: [[Double]] = [[1, -0.02, 0, 0, 0, 0], [1, -0.04, 0, 0, 0, 0], [1, -0.06, 0, 0, 0, 0]]
+        // アクティブエリア 1016×616、DefaultCrop は 8 ピクセル内側の 1000×600
+        let geometry = DNGLensCorrection.Geometry(activeWidth: 1016, activeHeight: 616, cropX: 8, cropY: 8,
+                                                 cropWidth: 1000, cropHeight: 600)
+        let tags = DNGLensCorrection.Tags(warp: .init(planes: k, centerX: 0.5, centerY: 0.5), gainMap: nil,
+                                          geometry: geometry, otherOpcodes: [])
+        let data = try XCTUnwrap(DNGLensCorrection.data(from: tags))
+        let cropDiagonal: Double = (1000.0 * 1000.0 + 600.0 * 600.0).squareRoot()
+        let activeDiagonal: Double = (1016.0 * 1016.0 + 616.0 * 616.0).squareRoot()
+        let scale = cropDiagonal / activeDiagonal
+        for r in [0.0, 0.3, 0.77, 1] {
+            let rw = r * scale
+            XCTAssertEqual(data.magnification(.green, at: r, settings: .all), 1 - 0.04 * rw * rw, accuracy: 1e-4)
+            XCTAssertEqual(data.magnification(.red, at: r, settings: .all), 1 - 0.02 * rw * rw, accuracy: 1e-4)
+            XCTAssertEqual(data.magnification(.blue, at: r, settings: .all), 1 - 0.06 * rw * rw, accuracy: 1e-4)
+            // 色収差を切れば R・B も G と同じ
+            let noCA = LensCorrectionSettings(vignetting: true, distortion: true, chromaticAberration: false)
+            XCTAssertEqual(data.magnification(.red, at: r, settings: noCA), data.magnification(.green, at: r, settings: noCA))
+        }
+        XCTAssertEqual(data.vignetting.allSatisfy { $0 == 1 }, true)
+        XCTAssertEqual(data.cameraSettings, .all)
+        // 補正値が何も無ければ nil
+        XCTAssertNil(DNGLensCorrection.data(from: .init(warp: nil, gainMap: nil, geometry: geometry, otherOpcodes: [])))
+    }
+
+    /// 放射状に作ったゲインの表から、元の周辺減光の係数(ゲインの逆数)に戻る
+    func testRadialGainMapRoundTrips() throws {
+        let (w, h) = (1200.0, 800.0)
+        let half = (w * w + h * h).squareRoot() / 2
+        func gain(_ x: Double, _ y: Double) -> Float {
+            let r = ((x - w / 2) * (x - w / 2) + (y - h / 2) * (y - h / 2)).squareRoot() / half
+            return Float(1 + 0.8 * r * r)
+        }
+        let map = try XCTUnwrap(DNGLensCorrection.gainMap(from: gainMapParams(width: Int(w), height: Int(h), rows: 41, cols: 61, gain: gain)))
+        let geometry = DNGLensCorrection.Geometry(activeWidth: w, activeHeight: h, cropX: 0, cropY: 0, cropWidth: w, cropHeight: h)
+        let data = try XCTUnwrap(DNGLensCorrection.data(from: .init(warp: nil, gainMap: map, geometry: geometry, otherOpcodes: [])))
+        for r in [0.0, 0.25, 0.5, 0.8, 0.95] {
+            XCTAssertEqual(data.vignettingFactor(at: r, settings: .all), 1 / (1 + 0.8 * r * r), accuracy: 0.01, "r = \(r)")
+        }
+        // 歪曲は無し
+        XCTAssertEqual(data.magnification(.green, at: 1, settings: .all), 1)
+    }
+
+    func testSigmaFpProfiles() {
+        let registry = CameraRegistry.makeDefault()
+        XCTAssertEqual(registry.profile(for: RAWMetadata(make: "SIGMA", model: "SIGMA fp L"))?.id, "sigma.fp-l")
+        XCTAssertEqual(registry.profile(for: RAWMetadata(make: "SIGMA", model: "SIGMA fp"))?.id, "sigma.fp")
+        XCTAssertNil(registry.profile(for: RAWMetadata(make: "SIGMA", model: "SIGMA BF")))
+        XCTAssertNil(registry.profile(for: RAWMetadata(make: "SONY", model: "SIGMA fp")))
+        XCTAssertNil(registry.profile(for: RAWMetadata(make: "LEICA", model: "Q3")))
+        XCTAssertTrue(registry.isCandidate(URL(fileURLWithPath: "/a/SDIM0001.DNG")))
+        // α7S III はそのまま
+        XCTAssertEqual(registry.profile(for: RAWMetadata(make: "SONY", model: "ILCE-7SM3"))?.id, "sony.ilce-7sm3")
+    }
+
+    // MARK: 実サンプル
+
+    /// 実際の DNG: 開けて補正値が読め、周辺減光の補正で隅が中心に比べて換算どおり明るくなる
+    func testSampleDNGVignetting() throws {
+        for name in ["SDIM7600.DNG", "SDIM7513.DNG"] {
+            let url = try sample(name)
+            let engine = RAWEngine()
+            let photo = try engine.open(url)
+            XCTAssertEqual(photo.profile.id, "sigma.fp-l")
+            let lens = try XCTUnwrap(photo.lensCorrection)
+            var s = DevelopSettings()
+            func cornerToCenter(_ settings: LensCorrectionSettings) throws -> Double {
+                s.lens = settings
+                let img = try engine.pipeline.process(photo, settings: s, options: RenderOptions(scale: 0.1))
+                let e = img.extent
+                func mean(_ r: CGRect) -> Double {
+                    let avg = img.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: r)])
+                    var px = [Float](repeating: 0, count: 4)
+                    ctx.render(avg, toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+                    return Double(px[0] + px[1] + px[2])
+                }
+                return mean(CGRect(x: e.minX + 2, y: e.minY + 2, width: 12, height: 12))
+                    / mean(CGRect(x: e.midX - 6, y: e.midY - 6, width: 12, height: 12))
+            }
+            let before = try cornerToCenter(.off)
+            let after = try cornerToCenter(LensCorrectionSettings(vignetting: true, distortion: false, chromaticAberration: false))
+            // 隅の窓の中心の半径での係数から見込む明るさの比(非線形な処理の後なので 3% の幅を見る)
+            let e = photo.source.nativeSize
+            let r = 1 - 8 * 10 / (e.width * e.width + e.height * e.height).squareRoot() * 2
+            let expected = 1 / lens.vignettingFactor(at: r, settings: .all)
+            print(String(format: "%@: 隅/中心 %.4f → %.4f(比 %.4f、見込み %.4f)", name, before, after, after / before, expected))
+            XCTAssertGreaterThan(after / before, 1)
+            XCTAssertEqual(after / before, expected, accuracy: (expected - 1) * 0.5 + 0.03)
+        }
+    }
+
+    /// GainMap がどれだけ放射状から外れているか(角度方向のばらつき)を測って記録する。大きければ放射状の近似を見直す
+    func testSampleGainMapIsNearlyRadial() throws {
+        for name in ["SDIM7600.DNG", "SDIM7513.DNG"] {
+            // XCTUnwrap の中で sample を呼ぶと、サンプルが無いときの XCTSkip が失敗として扱われる
+            let url = try sample(name)
+            let tags = try XCTUnwrap(DNGLensCorrection.readTags(from: url))
+            let map = try XCTUnwrap(tags.gainMap)
+            let g = tags.geometry
+            let c = SIMD2(g.cropX + g.cropWidth / 2, g.cropY + g.cropHeight / 2)
+            let radius = (g.cropWidth * g.cropWidth + g.cropHeight * g.cropHeight).squareRoot() / 2
+            var worst = 0.0
+            for r in stride(from: 0.1, through: 0.95, by: 0.05) {
+                var values: [Double] = []
+                for s in 0..<360 {
+                    let a = Double(s) * .pi / 180
+                    let p = c + SIMD2(cos(a), sin(a)) * (r * radius)
+                    guard p.x >= 0, p.y >= 0, p.x <= g.activeWidth, p.y <= g.activeHeight else { continue }
+                    values.append(map.gain(x: p.x, y: p.y))
+                }
+                guard let lo = values.min(), let hi = values.max() else { continue }
+                worst = max(worst, log2(hi / lo))
+            }
+            print(String(format: "%@: 同じ半径でのゲインの最大と最小の差 %.3f EV", name, worst))
+            XCTAssertLessThan(worst, 0.1, name)
+        }
     }
 }

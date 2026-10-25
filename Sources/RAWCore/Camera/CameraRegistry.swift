@@ -12,6 +12,8 @@ public final class CameraRegistry {
     public static func makeDefault() -> CameraRegistry {
         CameraRegistry(profiles: [
             SonyA7S3Profile(),
+            SigmaFpProfile.fp,
+            SigmaFpProfile.fpL,
         ])
     }
 

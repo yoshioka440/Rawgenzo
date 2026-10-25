@@ -82,6 +82,37 @@ struct TIFFReader {
         return values
     }
 
+    /// 値をバイト列のまま読む(UNDEFINED 型(7)や BYTE 型(1)。DNG のオプコードの並びなど)
+    func bytes(_ e: Entry) -> Data? {
+        guard e.type == 7 || e.type == 1, e.count > 0, e.count < 16_000_000 else { return nil }
+        let start: Int
+        if e.count <= 4 {
+            start = e.fieldOffset
+        } else {
+            guard let p = u32(at: e.fieldOffset) else { return nil }
+            start = Int(p)
+        }
+        guard start >= 0, start + e.count <= data.count else { return nil }
+        return data.subdata(in: (data.startIndex + start)..<(data.startIndex + start + e.count))
+    }
+
+    /// 数として読める型(整数の型と RATIONAL / SRATIONAL)の値を Double で全部読む
+    func numbers(_ e: Entry) -> [Double]? {
+        if let ints = integers(e) { return ints.map(Double.init) }
+        guard e.type == 5 || e.type == 10, e.count > 0, e.count < 100_000,
+              let p = u32(at: e.fieldOffset) else { return nil }
+        let start = Int(p)
+        guard start + 8 * e.count <= data.count else { return nil }
+        return (0..<e.count).map { i in
+            let n = u32(at: start + i * 8)!, d = u32(at: start + i * 8 + 4)!
+            if e.type == 10 {
+                let sd = Int32(bitPattern: d)
+                return sd == 0 ? 0 : Double(Int32(bitPattern: n)) / Double(sd)
+            }
+            return d == 0 ? 0 : Double(n) / Double(d)
+        }
+    }
+
     // MARK: - バイト列
 
     private func u16(at p: Int) -> UInt16? {

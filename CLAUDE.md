@@ -1,7 +1,7 @@
 # CLAUDE.md — Rawgenzo 引継書
 
 Apple Silicon ネイティブの個人用 RAW 現像ソフト。SILKYPIX が Apple Silicon にネイティブ対応しないため自作した。
-対象カメラは当面 **SONY α7S III (ILCE-7SM3) の ARW のみ**。ただし機種を後から増やせる設計にしてある。
+対象カメラは **SONY α7S III (ILCE-7SM3) の ARW** と **SIGMA fp / fp L の DNG**。機種を後から増やせる設計にしてある。
 
 2026-10-07 に RAWprocessor から改名し、**Rawgenzo** として公開した(MIT License)。
 ソースは https://github.com/Rawgenzo/Rawgenzo 、公式ページは https://rawgenzo.github.io
@@ -49,11 +49,12 @@ swift run rawdev mcp AItrial --log AItrial/mcp-log.jsonl   # MCP サーバー(st
 ```
 Package.swift
 Sources/RAWCore/            現像エンジン。UI 非依存(SwiftUI を import しない)
-  Camera/                   CameraProfile(機種定義)、CameraRegistry、Sony/SonyA7S3Profile、Sony/SonyLensCorrection
+  Camera/                   CameraProfile(機種定義)、CameraRegistry、Sony/SonyA7S3Profile、Sony/SonyLensCorrection、Sigma/SigmaFpProfile(id は sigma.fp / sigma.fp-l)
   Decode/                   RAWSource(デコーダの抽象)、CoreImageRAWSource(CIRAWFilter)
   Pipeline/                 DevelopStage、DevelopPipeline、Stages(HDRトーン・色・クロップ・ルック)、
                             ContrastStage(自前のトーンカーブ)、MetalKernels(実行時にコンパイルする GPU のカーネル)
-  Lens/                     レンズ補正: LensCorrection(補正データと換算)、LensCorrector(Metal のカーネル)、TIFFReader
+  Lens/                     レンズ補正: LensCorrection(補正データと換算)、LensCorrector(Metal のカーネル)、TIFFReader、
+                            DNGLensCorrection(DNG の GainMap・WarpRectilinear を読んで換算)
   Look/                     Look、LookRegistry、BuiltInLooks、ColorCubeLook、CubeFileLook(.cube)
   Composition/              構図ガイドの幾何計算(CompositionGuide)
   Config/                   RawgenzoPaths、ExportPreferences、FileNameTemplate、SharedConfig
@@ -278,6 +279,13 @@ ARW → CameraRegistry が機種判定 → CameraProfile.makeSource → RAWSourc
   ARW に記録された補正値で自前で補正している(`Lens/`、調査メモ: `docs/sony-lens-correction.md`)。
   換算の式は darktable のもの(GPL なのでコードは写さず式だけ)。歪曲は lensfun と照合済み、周辺減光の強さは未検証
   (ARW の埋め込みプレビューはカメラの補正が掛かっていないので、比較に使えない)
+- **fp L の DNG ではデコーダ(CIRAWFilter)のレンズ補正は効くが、使わない**。理由は 2 つ。
+  (1) 周辺減光を直さない。Core Image は DNG の周辺減光の補正値(GainMap)を使わず、補正のオン・オフどちらでも
+  GainMap を消した写しと画素単位で同じ出力になる(`testDecoderIgnoresGainMap`)。
+  (2) 項目ごとに切れない。オン・オフが 1 つしかなく、歪曲と倍率色収差を別々に切れない。これを使うと、ARW と同じ 3 項目の
+  チェック(調整パネル・CLI の `--lens`・AI の set_lens_correction)が DNG では成り立たない。
+  そこで DNG の補正値を読み、ARW と同じく自前で 3 項目に分けて掛ける(`DNGLensCorrection`)。歪曲・倍率色収差は
+  Core Image の補正とほぼ同じ画像になることをテストで確かめている(`testWarpMatchesCoreImage`)。詳しくは `docs/dng-lens-correction.md`
 - **`DevelopSettings.lens` は Optional**。nil = 撮影時のカメラ設定に従う(オーナーの決定。旧サイドカーも同じ扱い)。
   「全部切る」を `.none` と名付けたら `s.lens = .none` が nil(カメラ設定)になる取り違えが起きたので `.off` にした
 - **Metal のカーネル(CIImageProcessorKernel)に渡るテクスチャは 1 行目が上端**(Core Image の座標で y が大きい側)。
@@ -337,8 +345,8 @@ README.md(利用者向けの説明)も合わせて更新する。
 
 オーナーから要望が出たら着手する。勝手に始めない。
 
-- 対応カメラが α7S III のみ
-- レンズ補正は ARW に補正値があるレンズだけ。周辺減光の補正の強さが実際のレンズと合っているかは未検証
+- 対応カメラが α7S III と SIGMA fp / fp L のみ
+- レンズ補正は RAW に補正値があるレンズだけ。周辺減光の補正の強さが実際のレンズと合っているかは未検証(ARW・DNG とも)
   (均一に照らされた被写体の写真か、カメラが記録した JPEG と比べれば確かめられる)
 - アプリで一括現像ができない(CLI はフォルダ単位で可能)
 - HDR 出力時もプレビューは SDR 表示(EDR 表示には Metal ビューが必要)
